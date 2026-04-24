@@ -1,7 +1,6 @@
 import os
-import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -9,240 +8,252 @@ from telegram.ext import (
     filters, ContextTypes, CallbackQueryHandler
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from openai import OpenAI
+import httpx
 import json
-from db import init_db, save_reminder, get_pending_reminders, mark_done, get_reminder_by_id
-
-logging.basicConfig(level=logging.INFO)
+ 
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
-
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+ 
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 TIMEZONE = "America/Guatemala"
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+ 
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN no está configurado")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY no está configurado")
+ 
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
-
-# ── Extraer recordatorio con IA ──────────────────────────────────────────────
-
-def extract_reminder(text: str) -> dict | None:
-    now = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d %H:%M")
-    prompt = f"""
-Eres un asistente que extrae recordatorios de mensajes en español.
-La fecha y hora actual es: {now} (zona horaria Guatemala, UTC-6).
-
+ 
+# Base de datos simple en memoria + archivo
+import sqlite3
+ 
+DB_PATH = "reminders.db"
+ 
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            task TEXT NOT NULL,
+            time TEXT NOT NULL,
+            done INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+ 
+def save_reminder(chat_id, task, time):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute("INSERT INTO reminders (chat_id, task, time) VALUES (?, ?, ?)", (chat_id, task, time))
+    conn.commit()
+    rid = cur.lastrowid
+    conn.close()
+    return rid
+ 
+def get_reminder(rid):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM reminders WHERE id = ?", (rid,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+ 
+def mark_done(rid):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE reminders SET done = 1 WHERE id = ?", (rid,))
+    conn.commit()
+    conn.close()
+ 
+def get_pending(chat_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM reminders WHERE chat_id = ? AND done = 0 ORDER BY time ASC", (chat_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+ 
+# ── OpenAI via httpx (sin cliente oficial) ───────────────────────────────────
+ 
+async def extract_reminder(text: str) -> dict | None:
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+    prompt = f"""Eres un asistente que extrae recordatorios de mensajes en español.
+La fecha y hora actual es: {now} (Guatemala, UTC-6).
+ 
 Del siguiente mensaje extrae:
-- "task": qué debe recordar el usuario (descripción breve)
-- "time": la hora/fecha en formato ISO 8601 (YYYY-MM-DDTHH:MM:00)
-
-Si no hay una hora clara, devuelve null.
-Responde SOLO con JSON, sin texto extra, sin backticks.
-
+- "task": qué debe recordar el usuario
+- "time": la hora en formato ISO 8601 (YYYY-MM-DDTHH:MM:00)
+ 
+Si no hay hora clara, devuelve null para "time".
+Responde SOLO con JSON sin texto extra ni backticks.
+ 
 Mensaje: "{text}"
 """
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-    raw = response.choices[0].message.content.strip()
-    try:
-        data = json.loads(raw)
-        if data.get("time") and data.get("task"):
-            return data
-    except Exception:
-        pass
-    return None
-
-
-# ── Transcribir audio ────────────────────────────────────────────────────────
-
-async def transcribe_audio(file_path: str) -> str:
-    with open(file_path, "rb") as f:
-        transcript = openai_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-            language="es"
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0
+            }
         )
-    return transcript.text
-
-
-# ── Enviar recordatorio ──────────────────────────────────────────────────────
-
-async def send_reminder(app: Application, chat_id: int, reminder_id: int, task: str):
-    keyboard = [[InlineKeyboardButton("✅ Completado", callback_data=f"done_{reminder_id}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await app.bot.send_message(
-        chat_id=chat_id,
-        text=f"🔔 *Recordatorio:* {task}\n\nPresiona el botón cuando lo hayas completado.",
-        parse_mode="Markdown",
-        reply_markup=reply_markup
-    )
-    # Re-agendar en 5 minutos si no se completa
-    scheduler.add_job(
-        send_reminder,
-        "date",
-        run_date=datetime.now(pytz.timezone(TIMEZONE)).replace(second=0, microsecond=0).__class__.now(pytz.timezone(TIMEZONE)).replace(second=0),
-        args=[app, chat_id, reminder_id, task],
-        id=f"retry_{reminder_id}_{datetime.now().timestamp()}",
-        misfire_grace_time=60
-    )
-
-
+        data = response.json()
+        raw = data["choices"][0]["message"]["content"].strip()
+        try:
+            result = json.loads(raw)
+            if result.get("time") and result.get("task"):
+                return result
+        except Exception:
+            pass
+    return None
+ 
+ 
+async def transcribe_audio(file_path: str) -> str:
+    async with httpx.AsyncClient(timeout=60) as client:
+        with open(file_path, "rb") as f:
+            response = await client.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                data={"model": "whisper-1", "language": "es"},
+                files={"file": ("audio.ogg", f, "audio/ogg")}
+            )
+        return response.json()["text"]
+ 
+ 
+# ── Jobs ─────────────────────────────────────────────────────────────────────
+ 
 async def send_reminder_job(app, chat_id, reminder_id, task):
-    """Job que se ejecuta y luego reagenda cada 5 min hasta completar."""
-    from db import get_reminder_by_id
-    r = get_reminder_by_id(reminder_id)
+    r = get_reminder(reminder_id)
     if r and not r["done"]:
         keyboard = [[InlineKeyboardButton("✅ Completado", callback_data=f"done_{reminder_id}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
         await app.bot.send_message(
             chat_id=chat_id,
             text=f"🔔 *Recordatorio:* {task}\n\n¡Presiona Completado cuando termines!",
             parse_mode="Markdown",
-            reply_markup=reply_markup
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        # Reagendar en 5 minutos
-        from datetime import timedelta
         next_time = datetime.now(pytz.timezone(TIMEZONE)) + timedelta(minutes=5)
-        job_id = f"remind_{reminder_id}_{next_time.timestamp()}"
         scheduler.add_job(
-            send_reminder_job,
-            "date",
-            run_date=next_time,
+            send_reminder_job, "date", run_date=next_time,
             args=[app, chat_id, reminder_id, task],
-            id=job_id,
+            id=f"remind_{reminder_id}_{next_time.timestamp()}",
             misfire_grace_time=120
         )
-
-
+ 
+ 
 # ── Handlers ─────────────────────────────────────────────────────────────────
-
+ 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 ¡Hola! Soy tu bot de recordatorios.\n\n"
-        "Puedes escribirme o mandarme un audio, por ejemplo:\n"
+        "Escríbeme o mándame un audio, por ejemplo:\n"
         "• *'Recuérdame llamar a mi esposa a las 3pm'*\n"
-        "• *'Mañana a las 9am tengo reunión con el doctor'*\n\n"
-        "Cuando llegue la hora, te avisaré cada 5 minutos hasta que marques ✅ Completado.",
+        "• *'Mañana a las 9am tengo reunión'*\n\n"
+        "Te avisaré cada 5 minutos hasta que marques ✅ Completado.",
         parse_mode="Markdown"
     )
-
-
+ 
+ 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
-
     await update.message.reply_text("⏳ Procesando tu recordatorio...")
-
-    data = extract_reminder(text)
+ 
+    try:
+        data = await extract_reminder(text)
+    except Exception as e:
+        logger.error(f"Error OpenAI: {e}")
+        await update.message.reply_text("❌ Error conectando con la IA. Intenta de nuevo.")
+        return
+ 
     if not data:
         await update.message.reply_text(
-            "❌ No pude entender la hora del recordatorio. "
-            "Intenta ser más específico, por ejemplo: 'Recuérdame a las 3pm llamar a Juan'."
+            "❌ No pude entender la hora. Intenta: 'Recuérdame a las 3pm llamar a Juan'"
         )
         return
-
+ 
     tz = pytz.timezone(TIMEZONE)
     run_date = datetime.fromisoformat(data["time"])
     if run_date.tzinfo is None:
         run_date = tz.localize(run_date)
-
+ 
     reminder_id = save_reminder(chat_id, data["task"], run_date.isoformat())
-    job_id = f"remind_{reminder_id}"
-
     scheduler.add_job(
-        send_reminder_job,
-        "date",
-        run_date=run_date,
+        send_reminder_job, "date", run_date=run_date,
         args=[context.application, chat_id, reminder_id, data["task"]],
-        id=job_id,
+        id=f"remind_{reminder_id}",
         misfire_grace_time=120
     )
-
+ 
     formatted = run_date.strftime("%d/%m/%Y a las %I:%M %p")
     await update.message.reply_text(
-        f"✅ Recordatorio guardado:\n\n"
-        f"📌 *{data['task']}*\n"
-        f"🕐 {formatted}",
+        f"✅ *Recordatorio guardado:*\n\n📌 {data['task']}\n🕐 {formatted}",
         parse_mode="Markdown"
     )
-
-
+ 
+ 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text("🎤 Escuché tu audio, transcribiendo...")
-
+    await update.message.reply_text("🎤 Transcribiendo tu audio...")
     voice = update.message.voice
     file = await context.bot.get_file(voice.file_id)
     file_path = f"/tmp/voice_{chat_id}.ogg"
     await file.download_to_drive(file_path)
-
     try:
         text = await transcribe_audio(file_path)
         await update.message.reply_text(f"📝 Entendí: _{text}_", parse_mode="Markdown")
-        # Reusar el handler de texto
         update.message.text = text
         await handle_text(update, context)
     except Exception as e:
-        logger.error(f"Error transcribiendo audio: {e}")
+        logger.error(f"Error audio: {e}")
         await update.message.reply_text("❌ No pude procesar el audio. Intenta de nuevo.")
-
-
+ 
+ 
 async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     reminder_id = int(query.data.split("_")[1])
     mark_done(reminder_id)
-
-    # Cancelar jobs pendientes de este recordatorio
     for job in scheduler.get_jobs():
         if job.id.startswith(f"remind_{reminder_id}"):
             job.remove()
-
-    await query.edit_message_text(
-        f"✅ ¡Listo! Recordatorio completado.\n\n_{query.message.text}_",
-        parse_mode="Markdown"
-    )
-
-
+    await query.edit_message_text("✅ ¡Recordatorio completado!", parse_mode="Markdown")
+ 
+ 
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    reminders = get_pending_reminders(chat_id)
+    reminders = get_pending(chat_id)
     if not reminders:
         await update.message.reply_text("📭 No tienes recordatorios pendientes.")
         return
-
-    msg = "📋 *Tus recordatorios pendientes:*\n\n"
     tz = pytz.timezone(TIMEZONE)
+    msg = "📋 *Tus recordatorios pendientes:*\n\n"
     for r in reminders:
         dt = datetime.fromisoformat(r["time"])
         if dt.tzinfo is None:
             dt = tz.localize(dt)
-        formatted = dt.strftime("%d/%m/%Y %I:%M %p")
-        msg += f"• {r['task']} — {formatted}\n"
-
+        msg += f"• {r['task']} — {dt.strftime('%d/%m %I:%M %p')}\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
-
-
+ 
+ 
 # ── Main ─────────────────────────────────────────────────────────────────────
-
+ 
 def main():
     init_db()
-
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("lista", list_reminders))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(CallbackQueryHandler(handle_done, pattern=r"^done_\d+$"))
-
     scheduler.start()
-    logger.info("Bot iniciado ✅")
-    app.run_polling()
-
-
+    logger.info("✅ Bot iniciado correctamente")
+    app.run_polling(drop_pending_updates=True)
+ 
 if __name__ == "__main__":
     main()
