@@ -11,27 +11,27 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import httpx
 import json
 import sqlite3
- 
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
- 
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 TIMEZONE = "America/Guatemala"
- 
+
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN no está configurado")
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY no está configurado")
- 
+
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 DB_PATH = "reminders.db"
- 
+
 # ── Base de datos ─────────────────────────────────────────────────────────────
- 
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
@@ -45,7 +45,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
- 
+
 def save_reminder(chat_id, task, time):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute("INSERT INTO reminders (chat_id, task, time) VALUES (?, ?, ?)", (chat_id, task, time))
@@ -53,45 +53,45 @@ def save_reminder(chat_id, task, time):
     rid = cur.lastrowid
     conn.close()
     return rid
- 
+
 def get_reminder(rid):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     row = conn.execute("SELECT * FROM reminders WHERE id = ?", (rid,)).fetchone()
     conn.close()
     return dict(row) if row else None
- 
+
 def mark_done(rid):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("UPDATE reminders SET done = 1 WHERE id = ?", (rid,))
     conn.commit()
     conn.close()
- 
+
 def get_pending(chat_id):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT * FROM reminders WHERE chat_id = ? AND done = 0 ORDER BY time ASC", (chat_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
- 
+
 # ── Gemini ────────────────────────────────────────────────────────────────────
- 
+
 async def extract_reminder(text: str) -> dict | None:
     tz = pytz.timezone(TIMEZONE)
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
     prompt = f"""Eres un asistente que extrae recordatorios de mensajes en español.
 La fecha y hora actual es: {now} (Guatemala, UTC-6).
- 
+
 Del siguiente mensaje extrae:
 - "task": qué debe recordar el usuario
 - "time": la hora en formato ISO 8601 (YYYY-MM-DDTHH:MM:00)
- 
+
 Si no hay hora clara, devuelve null para "time".
 Responde SOLO con JSON sin texto extra ni backticks.
- 
+
 Mensaje: "{text}"
 """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             url,
@@ -108,15 +108,15 @@ Mensaje: "{text}"
         except Exception as e:
             logger.error(f"Error parseando JSON de Gemini: {e} - raw: {raw}")
     return None
- 
- 
+
+
 async def transcribe_audio(file_path: str) -> str:
     """Transcribe audio usando Gemini."""
     import base64
     with open(file_path, "rb") as f:
         audio_data = base64.b64encode(f.read()).decode()
- 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
             url,
@@ -132,10 +132,10 @@ async def transcribe_audio(file_path: str) -> str:
         )
         data = response.json()
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
- 
- 
+
+
 # ── Jobs ──────────────────────────────────────────────────────────────────────
- 
+
 async def send_reminder_job(app, chat_id, reminder_id, task):
     r = get_reminder(reminder_id)
     if r and not r["done"]:
@@ -153,10 +153,10 @@ async def send_reminder_job(app, chat_id, reminder_id, task):
             id=f"remind_{reminder_id}_{next_time.timestamp()}",
             misfire_grace_time=120
         )
- 
- 
+
+
 # ── Handlers ──────────────────────────────────────────────────────────────────
- 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 ¡Hola! Soy tu bot de recordatorios.\n\n"
@@ -166,31 +166,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Te avisaré cada 5 minutos hasta que marques ✅ Completado.",
         parse_mode="Markdown"
     )
- 
- 
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
     await update.message.reply_text("⏳ Procesando tu recordatorio...")
- 
+
     try:
         data = await extract_reminder(text)
     except Exception as e:
         logger.error(f"Error Gemini: {e}")
         await update.message.reply_text("❌ Error conectando con la IA. Intenta de nuevo.")
         return
- 
+
     if not data:
         await update.message.reply_text(
             "❌ No pude entender la hora. Intenta: 'Recuérdame a las 3pm llamar a Juan'"
         )
         return
- 
+
     tz = pytz.timezone(TIMEZONE)
     run_date = datetime.fromisoformat(data["time"])
     if run_date.tzinfo is None:
         run_date = tz.localize(run_date)
- 
+
     reminder_id = save_reminder(chat_id, data["task"], run_date.isoformat())
     scheduler.add_job(
         send_reminder_job, "date", run_date=run_date,
@@ -198,14 +198,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         id=f"remind_{reminder_id}",
         misfire_grace_time=120
     )
- 
+
     formatted = run_date.strftime("%d/%m/%Y a las %I:%M %p")
     await update.message.reply_text(
         f"✅ *Recordatorio guardado:*\n\n📌 {data['task']}\n🕐 {formatted}",
         parse_mode="Markdown"
     )
- 
- 
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text("🎤 Transcribiendo tu audio...")
@@ -221,8 +221,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error audio: {e}")
         await update.message.reply_text("❌ No pude procesar el audio. Intenta de nuevo.")
- 
- 
+
+
 async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -232,8 +232,8 @@ async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if job.id.startswith(f"remind_{reminder_id}"):
             job.remove()
     await query.edit_message_text("✅ ¡Recordatorio completado!")
- 
- 
+
+
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     reminders = get_pending(chat_id)
@@ -248,10 +248,10 @@ async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dt = tz.localize(dt)
         msg += f"• {r['task']} — {dt.strftime('%d/%m %I:%M %p')}\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
- 
- 
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
- 
+
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -263,6 +263,6 @@ def main():
     scheduler.start()
     logger.info("✅ Bot iniciado con Gemini")
     app.run_polling(drop_pending_updates=True)
- 
+
 if __name__ == "__main__":
     main()
