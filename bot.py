@@ -10,6 +10,7 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import httpx
 import json
+import sqlite3
  
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -18,20 +19,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
  
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 TIMEZONE = "America/Guatemala"
  
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN no está configurado")
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY no está configurado")
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY no está configurado")
  
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
- 
-# Base de datos simple en memoria + archivo
-import sqlite3
- 
 DB_PATH = "reminders.db"
+ 
+# ── Base de datos ─────────────────────────────────────────────────────────────
  
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -75,7 +74,7 @@ def get_pending(chat_id):
     conn.close()
     return [dict(r) for r in rows]
  
-# ── OpenAI via httpx (sin cliente oficial) ───────────────────────────────────
+# ── Gemini ────────────────────────────────────────────────────────────────────
  
 async def extract_reminder(text: str) -> dict | None:
     tz = pytz.timezone(TIMEZONE)
@@ -92,40 +91,50 @@ Responde SOLO con JSON sin texto extra ni backticks.
  
 Mensaje: "{text}"
 """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0
-            }
+            url,
+            headers={"Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}]}
         )
         data = response.json()
-        raw = data["choices"][0]["message"]["content"].strip()
+        raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
         try:
             result = json.loads(raw)
             if result.get("time") and result.get("task"):
                 return result
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error parseando JSON de Gemini: {e} - raw: {raw}")
     return None
  
  
 async def transcribe_audio(file_path: str) -> str:
+    """Transcribe audio usando Gemini."""
+    import base64
+    with open(file_path, "rb") as f:
+        audio_data = base64.b64encode(f.read()).decode()
+ 
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     async with httpx.AsyncClient(timeout=60) as client:
-        with open(file_path, "rb") as f:
-            response = await client.post(
-                "https://api.openai.com/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                data={"model": "whisper-1", "language": "es"},
-                files={"file": ("audio.ogg", f, "audio/ogg")}
-            )
-        return response.json()["text"]
+        response = await client.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{
+                    "parts": [
+                        {"text": "Transcribe este audio en español. Responde solo con el texto transcrito, sin explicaciones."},
+                        {"inline_data": {"mime_type": "audio/ogg", "data": audio_data}}
+                    ]
+                }]
+            }
+        )
+        data = response.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
  
  
-# ── Jobs ─────────────────────────────────────────────────────────────────────
+# ── Jobs ──────────────────────────────────────────────────────────────────────
  
 async def send_reminder_job(app, chat_id, reminder_id, task):
     r = get_reminder(reminder_id)
@@ -146,7 +155,7 @@ async def send_reminder_job(app, chat_id, reminder_id, task):
         )
  
  
-# ── Handlers ─────────────────────────────────────────────────────────────────
+# ── Handlers ──────────────────────────────────────────────────────────────────
  
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -167,7 +176,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await extract_reminder(text)
     except Exception as e:
-        logger.error(f"Error OpenAI: {e}")
+        logger.error(f"Error Gemini: {e}")
         await update.message.reply_text("❌ Error conectando con la IA. Intenta de nuevo.")
         return
  
@@ -222,7 +231,7 @@ async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for job in scheduler.get_jobs():
         if job.id.startswith(f"remind_{reminder_id}"):
             job.remove()
-    await query.edit_message_text("✅ ¡Recordatorio completado!", parse_mode="Markdown")
+    await query.edit_message_text("✅ ¡Recordatorio completado!")
  
  
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -241,7 +250,7 @@ async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
  
  
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
  
 def main():
     init_db()
@@ -252,7 +261,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(CallbackQueryHandler(handle_done, pattern=r"^done_\d+$"))
     scheduler.start()
-    logger.info("✅ Bot iniciado correctamente")
+    logger.info("✅ Bot iniciado con Gemini")
     app.run_polling(drop_pending_updates=True)
  
 if __name__ == "__main__":
