@@ -346,6 +346,42 @@ def parse_add_item_request(text: str):
     return item, list_name
 
 
+def split_items(text: str):
+    """
+    Guarda items aunque el usuario los escriba:
+    - con comas: leche, pan, huevos
+    - en líneas separadas
+    - sin comas: leche pan huevos
+    - por audio: "leche pan huevos"
+    """
+    cleaned = text.strip()
+
+    # Quita palabras introductorias comunes.
+    cleaned = re.sub(
+        r"^(agrega|agregar|añade|añadir|pon|poner|mete|meter|incluye|incluir)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Si hay comas, saltos de línea o punto y coma, separamos por eso.
+    if re.search(r"[,\n;]+", cleaned):
+        raw_parts = re.split(r"[,\n;]+", cleaned)
+    else:
+        # Si no hay comas, separamos por espacios.
+        # Ejemplo: "leche pan huevos" => ["leche", "pan", "huevos"]
+        raw_parts = cleaned.split()
+
+    items = []
+
+    for part in raw_parts:
+        item = part.strip().strip("-").strip("•").strip(".").strip()
+        if item:
+            items.append(item)
+
+    return items
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # OPENAI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -624,13 +660,17 @@ async def handle_new_list_name(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ El nombre es muy corto. Escribe otro nombre.")
         return
 
-    create_list(chat_id, list_name)
+    list_id = create_list(chat_id, list_name)
     context.user_data["waiting_for_list_name"] = False
+    context.user_data["adding_items_to_list_id"] = list_id
+    context.user_data["adding_items_to_list_name"] = list_name
 
     await update.message.reply_text(
         f"✅ Lista creada: *{list_name}*\n\n"
-        f"Ahora puedes agregar items así:\n"
-        f"*agregar leche a la lista de {list_name}*",
+        "Ahora escribe los items separados por coma o en mensajes separados.\n\n"
+        "Ejemplo:\n"
+        "*leche, pan, papel, frutas, verduras*\n\n"
+        "Cuando termines, escribe *listo*.",
         parse_mode="Markdown",
     )
 
@@ -657,6 +697,48 @@ async def handle_add_item(update: Update, text: str):
 
     await update.message.reply_text(
         f"✅ Agregado a *{found_list['name']}*:\n📌 {item}",
+        parse_mode="Markdown",
+    )
+    return True
+
+
+
+async def handle_items_for_current_list(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    list_id = context.user_data.get("adding_items_to_list_id")
+    list_name = context.user_data.get("adding_items_to_list_name")
+
+    if not list_id:
+        return False
+
+    text_lower = text.strip().lower()
+
+    if text_lower in ["listo", "terminar", "finalizar", "ya", "hecho"]:
+        context.user_data.pop("adding_items_to_list_id", None)
+        context.user_data.pop("adding_items_to_list_name", None)
+        await update.message.reply_text(
+            f"✅ Perfecto. Terminé de agregar items a *{list_name}*.\n\n"
+            "Escribe *muéstrame mis listas* para verla.",
+            parse_mode="Markdown",
+        )
+        return True
+
+    items = split_items(text)
+
+    if not items:
+        await update.message.reply_text(
+            "❌ No pude detectar items. Intenta: *leche pan papel* o *leche, pan, papel*",
+            parse_mode="Markdown",
+        )
+        return True
+
+    for item in items:
+        add_item_to_list(list_id, item)
+
+    items_text = "\n".join([f"• {item}" for item in items])
+
+    await update.message.reply_text(
+        f"✅ Agregado a *{list_name}*:\n{items_text}\n\n"
+        "Puedes seguir enviando items o escribir *listo*.",
         parse_mode="Markdown",
     )
     return True
@@ -775,6 +857,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_new_list_name(update, context)
         return
 
+    if await handle_items_for_current_list(update, context, text):
+        return
+
     if is_create_list_request(text):
         await ask_list_name(update, context)
         return
@@ -813,8 +898,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if context.user_data.get("waiting_for_list_name"):
-            update.message.text = text
-            await handle_new_list_name(update, context)
+            await create_list_from_name(update, context, text)
+            return
+
+        if await handle_items_for_current_list(update, context, text):
             return
 
         if is_create_list_request(text):
