@@ -350,13 +350,12 @@ def split_items(text: str):
     """
     Guarda items aunque el usuario los escriba:
     - con comas: leche, pan, huevos
-    - en líneas separadas
+    - con saltos de línea
     - sin comas: leche pan huevos
     - por audio: "leche pan huevos"
     """
     cleaned = text.strip()
 
-    # Quita palabras introductorias comunes.
     cleaned = re.sub(
         r"^(agrega|agregar|añade|añadir|pon|poner|mete|meter|incluye|incluir)\s+",
         "",
@@ -364,16 +363,12 @@ def split_items(text: str):
         flags=re.IGNORECASE,
     )
 
-    # Si hay comas, saltos de línea o punto y coma, separamos por eso.
     if re.search(r"[,\n;]+", cleaned):
         raw_parts = re.split(r"[,\n;]+", cleaned)
     else:
-        # Si no hay comas, separamos por espacios.
-        # Ejemplo: "leche pan huevos" => ["leche", "pan", "huevos"]
         raw_parts = cleaned.split()
 
     items = []
-
     for part in raw_parts:
         item = part.strip().strip("-").strip("•").strip(".").strip()
         if item:
@@ -652,9 +647,9 @@ async def ask_list_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def handle_new_list_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def create_list_from_name(update: Update, context: ContextTypes.DEFAULT_TYPE, list_name: str):
     chat_id = update.effective_chat.id
-    list_name = update.message.text.strip()
+    list_name = list_name.strip()
 
     if len(list_name) < 2:
         await update.message.reply_text("❌ El nombre es muy corto. Escribe otro nombre.")
@@ -667,12 +662,17 @@ async def handle_new_list_name(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await update.message.reply_text(
         f"✅ Lista creada: *{list_name}*\n\n"
-        "Ahora escribe los items separados por coma o en mensajes separados.\n\n"
-        "Ejemplo:\n"
-        "*leche, pan, papel, frutas, verduras*\n\n"
+        "Ahora escribe los items como quieras: con comas, sin comas, por mensaje o por audio.\n\n"
+        "Ejemplos:\n"
+        "*leche, pan, papel, frutas, verduras*\n"
+        "*leche pan papel frutas verduras*\n\n"
         "Cuando termines, escribe *listo*.",
         parse_mode="Markdown",
     )
+
+
+async def handle_new_list_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await create_list_from_name(update, context, update.message.text)
 
 
 async def handle_add_item(update: Update, text: str):
