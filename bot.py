@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import sqlite3
+import re
 from datetime import datetime, timedelta
 
 import httpx
@@ -36,24 +37,38 @@ if not OPENAI_API_KEY:
 
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
-LIST_PHRASES = [
-    "lista",
+REMINDER_LIST_PHRASES = [
     "mis recordatorios",
-    "muéstrame",
-    "muestrame",
     "ver recordatorios",
-    "qué tengo",
-    "que tengo",
-    "pendientes",
+    "qué tengo pendiente",
+    "que tengo pendiente",
+    "recordatorios pendientes",
     "mis alertas",
-    "ver mis",
-    "show",
-    "listar",
+]
+
+LISTS_PHRASES = [
+    "listas",
+    "mis listas",
+    "muéstrame mis listas",
+    "muestrame mis listas",
+    "mostrar mis listas",
+    "ver mis listas",
 ]
 
 
-def init_db():
+# ─────────────────────────────────────────────────────────────────────────────
+# DATABASE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_conn():
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_conn()
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS reminders (
@@ -66,12 +81,41 @@ def init_db():
         )
         """
     )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS list_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            list_id INTEGER NOT NULL,
+            item TEXT NOT NULL,
+            completed INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (list_id) REFERENCES lists (id)
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# REMINDERS DB
+# ─────────────────────────────────────────────────────────────────────────────
+
 def save_reminder(chat_id: int, task: str, time: str) -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.execute(
         "INSERT INTO reminders (chat_id, task, time) VALUES (?, ?, ?)",
         (chat_id, task, time),
@@ -83,8 +127,7 @@ def save_reminder(chat_id: int, task: str, time: str) -> int:
 
 
 def get_reminder(reminder_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_conn()
     row = conn.execute(
         "SELECT * FROM reminders WHERE id = ?",
         (reminder_id,),
@@ -94,7 +137,7 @@ def get_reminder(reminder_id: int):
 
 
 def mark_done(reminder_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     conn.execute(
         "UPDATE reminders SET done = 1 WHERE id = ?",
         (reminder_id,),
@@ -103,13 +146,8 @@ def mark_done(reminder_id: int):
     conn.close()
 
 
-def delete_reminder(reminder_id: int):
-    mark_done(reminder_id)
-
-
-def get_pending(chat_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+def get_pending_reminders(chat_id: int):
+    conn = get_conn()
     rows = conn.execute(
         """
         SELECT * FROM reminders
@@ -122,16 +160,195 @@ def get_pending(chat_id: int):
     return [dict(row) for row in rows]
 
 
-def is_list_request(text: str) -> bool:
-    text_lower = text.lower().strip()
-    return any(phrase in text_lower for phrase in LIST_PHRASES)
-
-
 def remove_reminder_jobs(reminder_id: int):
     for job in scheduler.get_jobs():
         if job.id.startswith(f"remind_{reminder_id}"):
             job.remove()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LISTS DB
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_list(chat_id: int, name: str) -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO lists (chat_id, name) VALUES (?, ?)",
+        (chat_id, name.strip()),
+    )
+    conn.commit()
+    list_id = cur.lastrowid
+    conn.close()
+    return list_id
+
+
+def get_lists(chat_id: int):
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT * FROM lists
+        WHERE chat_id = ?
+        ORDER BY created_at DESC
+        """,
+        (chat_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_list_by_id(list_id: int):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM lists WHERE id = ?",
+        (list_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def find_list_by_name(chat_id: int, name: str):
+    name_clean = name.strip().lower()
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM lists WHERE chat_id = ?",
+        (chat_id,),
+    ).fetchall()
+    conn.close()
+
+    for row in rows:
+        if row["name"].strip().lower() == name_clean:
+            return dict(row)
+
+    for row in rows:
+        if name_clean in row["name"].strip().lower() or row["name"].strip().lower() in name_clean:
+            return dict(row)
+
+    return None
+
+
+def delete_list(list_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM list_items WHERE list_id = ?", (list_id,))
+    conn.execute("DELETE FROM lists WHERE id = ?", (list_id,))
+    conn.commit()
+    conn.close()
+
+
+def add_item_to_list(list_id: int, item: str) -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO list_items (list_id, item) VALUES (?, ?)",
+        (list_id, item.strip()),
+    )
+    conn.commit()
+    item_id = cur.lastrowid
+    conn.close()
+    return item_id
+
+
+def get_items(list_id: int):
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT * FROM list_items
+        WHERE list_id = ?
+        ORDER BY created_at ASC
+        """,
+        (list_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def toggle_item(item_id: int):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT completed FROM list_items WHERE id = ?",
+        (item_id,),
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        return
+
+    new_value = 0 if row["completed"] else 1
+
+    conn.execute(
+        "UPDATE list_items SET completed = ? WHERE id = ?",
+        (new_value, item_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_item(item_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM list_items WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEXT DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def normalize(text: str) -> str:
+    return text.lower().strip()
+
+
+def is_reminder_list_request(text: str) -> bool:
+    text_lower = normalize(text)
+    return any(phrase in text_lower for phrase in REMINDER_LIST_PHRASES)
+
+
+def is_lists_request(text: str) -> bool:
+    text_lower = normalize(text)
+    return any(phrase in text_lower for phrase in LISTS_PHRASES)
+
+
+def is_create_list_request(text: str) -> bool:
+    text_lower = normalize(text)
+    patterns = [
+        "crear una lista nueva",
+        "crear lista nueva",
+        "nueva lista",
+        "quiero crear una lista",
+        "crear una lista",
+    ]
+    return any(pattern in text_lower for pattern in patterns)
+
+
+def parse_add_item_request(text: str):
+    """
+    Supported examples:
+    - agregar leche a la lista de supermercado
+    - agrega pan a la lista supermercado
+    - añade huevos a la lista de compras
+    """
+    text_clean = text.strip()
+
+    pattern = re.compile(
+        r"^(agregar|agrega|añadir|añade|poner|pon)\s+(.+?)\s+a\s+la\s+lista(?:\s+de)?\s+(.+)$",
+        re.IGNORECASE,
+    )
+
+    match = pattern.match(text_clean)
+
+    if not match:
+        return None
+
+    item = match.group(2).strip().strip('"').strip("'")
+    list_name = match.group(3).strip().strip('"').strip("'")
+
+    if not item or not list_name:
+        return None
+
+    return item, list_name
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPENAI
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def extract_reminder(text: str) -> dict | None:
     tz = pytz.timezone(TIMEZONE)
@@ -153,6 +370,7 @@ Reglas:
 - Si dice "mañana", usa la fecha de mañana.
 - Si dice "a las 3", interpreta según contexto como 3 PM si parece horario diurno.
 - Si no hay hora clara, devuelve "time": null.
+- Si el mensaje parece de listas, compras o items sin hora, devuelve "time": null.
 - Responde SOLO JSON válido.
 - No uses backticks.
 - No agregues explicación.
@@ -221,6 +439,10 @@ async def transcribe_audio(file_path: str) -> str:
     return data["text"]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# REMINDERS
+# ─────────────────────────────────────────────────────────────────────────────
+
 async def send_reminder_job(app, chat_id: int, reminder_id: int, task: str):
     reminder = get_reminder(reminder_id)
 
@@ -230,7 +452,7 @@ async def send_reminder_job(app, chat_id: int, reminder_id: int, task: str):
     keyboard = [
         [
             InlineKeyboardButton("✅ Completado", callback_data=f"done_{reminder_id}"),
-            InlineKeyboardButton("🗑️ Eliminar", callback_data=f"del_{reminder_id}"),
+            InlineKeyboardButton("🗑️ Eliminar", callback_data=f"delrem_{reminder_id}"),
         ]
     ]
 
@@ -253,11 +475,7 @@ async def send_reminder_job(app, chat_id: int, reminder_id: int, task: str):
     )
 
 
-async def create_reminder_from_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    text: str,
-):
+async def create_reminder_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     chat_id = update.effective_chat.id
 
     await update.message.reply_text("⏳ Procesando tu recordatorio...")
@@ -271,9 +489,14 @@ async def create_reminder_from_text(
 
     if not data:
         await update.message.reply_text(
-            "❌ No pude entender la hora.\n\n"
-            "Intenta: *'Recuérdame en 10 minutos tomar agua'*\n\n"
-            "O escribe *'lista'* para ver tus recordatorios.",
+            "❌ No pude entender una hora para recordatorio.\n\n"
+            "Ejemplos:\n"
+            "• *Recuérdame en 10 minutos tomar agua*\n"
+            "• *Recuérdame mañana a las 9 llamar al doctor*\n\n"
+            "Para listas puedes decir:\n"
+            "• *crear una lista nueva*\n"
+            "• *agregar leche a la lista de supermercado*\n"
+            "• *muéstrame mis listas*",
             parse_mode="Markdown",
         )
         return
@@ -287,9 +510,7 @@ async def create_reminder_from_text(
     now = datetime.now(tz)
 
     if run_date <= now:
-        await update.message.reply_text(
-            "❌ Esa hora ya pasó. Intenta con una hora futura.",
-        )
+        await update.message.reply_text("❌ Esa hora ya pasó. Intenta con una hora futura.")
         return
 
     reminder_id = save_reminder(chat_id, data["task"], run_date.isoformat())
@@ -314,7 +535,7 @@ async def create_reminder_from_text(
 
 
 async def show_reminders(update: Update, chat_id: int):
-    reminders = get_pending(chat_id)
+    reminders = get_pending_reminders(chat_id)
 
     if not reminders:
         await update.message.reply_text("📭 No tienes recordatorios pendientes.")
@@ -335,7 +556,7 @@ async def show_reminders(update: Update, chat_id: int):
         keyboard = [
             [
                 InlineKeyboardButton("✅ Completado", callback_data=f"done_{reminder['id']}"),
-                InlineKeyboardButton("🗑️ Eliminar", callback_data=f"del_{reminder['id']}"),
+                InlineKeyboardButton("🗑️ Eliminar", callback_data=f"delrem_{reminder['id']}"),
             ]
         ]
 
@@ -346,92 +567,8 @@ async def show_reminders(update: Update, chat_id: int):
         )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    first_name = user.first_name if user and user.first_name else "!"
-
-    await update.message.reply_text(
-        f"👋 ¡Hola {first_name}! Soy tu asistente de recordatorios.\n\n"
-        "Puedes escribirme o mandarme un audio, por ejemplo:\n"
-        "• *Recuérdame llamar a mi esposa a las 3pm*\n"
-        "• *Recuérdame en 10 minutos tomar agua*\n"
-        "• *Mañana a las 9am tengo reunión*\n\n"
-        "Para ver tus recordatorios escribe:\n"
-        "• *lista*\n"
-        "• *mis recordatorios*\n\n"
-        "Te avisaré cada 5 minutos hasta que marques ✅ Completado.",
-        parse_mode="Markdown",
-    )
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    chat_id = update.effective_chat.id
-
-    if is_list_request(text):
-        await show_reminders(update, chat_id)
-        return
-
-    await create_reminder_from_text(update, context, text)
-
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-
-    await update.message.reply_text("🎤 Transcribiendo tu audio...")
-
-    voice = update.message.voice
-    file = await context.bot.get_file(voice.file_id)
-    file_path = f"/tmp/voice_{chat_id}.ogg"
-
-    await file.download_to_drive(file_path)
-
-    try:
-        text = await transcribe_audio(file_path)
-
-        await update.message.reply_text(
-            f"📝 Entendí: _{text}_",
-            parse_mode="Markdown",
-        )
-
-        if is_list_request(text):
-            await show_reminders(update, chat_id)
-            return
-
-        await create_reminder_from_text(update, context, text)
-
-    except Exception as e:
-        logger.error(f"Error audio: {e}")
-        await update.message.reply_text("❌ No pude procesar el audio. Intenta de nuevo.")
-
-
-async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-    reminder_id = int(data.split("_")[1])
-
-    reminder = get_reminder(reminder_id)
-
-    if not reminder:
-        await query.edit_message_text("❌ Ese recordatorio ya no existe.")
-        return
-
-    if data.startswith("done_"):
-        mark_done(reminder_id)
-        remove_reminder_jobs(reminder_id)
-        await query.edit_message_text("✅ ¡Recordatorio completado!")
-
-    elif data.startswith("del_"):
-        delete_reminder(reminder_id)
-        remove_reminder_jobs(reminder_id)
-        await query.edit_message_text("🗑️ Recordatorio eliminado.")
-
-
 def restore_pending_reminders(app: Application):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_conn()
     rows = conn.execute(
         """
         SELECT * FROM reminders
@@ -466,16 +603,303 @@ def restore_pending_reminders(app: Application):
     logger.info(f"🔁 Recordatorios restaurados: {len(rows)}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# LISTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def ask_list_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["waiting_for_list_name"] = True
+    await update.message.reply_text(
+        "📝 Perfecto. ¿Qué nombre quieres ponerle a la lista?\n\n"
+        "Ejemplo: *Supermercado*, *Trabajo*, *Viaje*, *Compras*",
+        parse_mode="Markdown",
+    )
+
+
+async def handle_new_list_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    list_name = update.message.text.strip()
+
+    if len(list_name) < 2:
+        await update.message.reply_text("❌ El nombre es muy corto. Escribe otro nombre.")
+        return
+
+    create_list(chat_id, list_name)
+    context.user_data["waiting_for_list_name"] = False
+
+    await update.message.reply_text(
+        f"✅ Lista creada: *{list_name}*\n\n"
+        f"Ahora puedes agregar items así:\n"
+        f"*agregar leche a la lista de {list_name}*",
+        parse_mode="Markdown",
+    )
+
+
+async def handle_add_item(update: Update, text: str):
+    chat_id = update.effective_chat.id
+    parsed = parse_add_item_request(text)
+
+    if not parsed:
+        return False
+
+    item, list_name = parsed
+    found_list = find_list_by_name(chat_id, list_name)
+
+    if not found_list:
+        await update.message.reply_text(
+            f"❌ No encontré una lista llamada *{list_name}*.\n\n"
+            f"Escribe *listas* para ver tus listas o *crear una lista nueva*.",
+            parse_mode="Markdown",
+        )
+        return True
+
+    add_item_to_list(found_list["id"], item)
+
+    await update.message.reply_text(
+        f"✅ Agregado a *{found_list['name']}*:\n📌 {item}",
+        parse_mode="Markdown",
+    )
+    return True
+
+
+async def show_lists(update: Update, chat_id: int):
+    lists = get_lists(chat_id)
+
+    if not lists:
+        await update.message.reply_text(
+            "📭 No tienes listas todavía.\n\n"
+            "Para crear una, escribe:\n*crear una lista nueva*",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.reply_text("📋 *Tus listas:*", parse_mode="Markdown")
+
+    for user_list in lists:
+        items = get_items(user_list["id"])
+
+        if not items:
+            items_text = "_Sin items todavía._"
+        else:
+            lines = []
+            for item in items:
+                status = "✅" if item["completed"] else "⬜"
+                lines.append(f"{status} {item['item']}")
+            items_text = "\n".join(lines)
+
+        keyboard = [
+            [
+                InlineKeyboardButton("👁️ Ver/editar", callback_data=f"viewlist_{user_list['id']}"),
+                InlineKeyboardButton("🗑️ Eliminar lista", callback_data=f"dellist_{user_list['id']}"),
+            ]
+        ]
+
+        await update.message.reply_text(
+            f"🗂️ *{user_list['name']}*\n\n{items_text}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+
+async def show_single_list(query, list_id: int):
+    user_list = get_list_by_id(list_id)
+
+    if not user_list:
+        await query.edit_message_text("❌ Esa lista ya no existe.")
+        return
+
+    items = get_items(list_id)
+
+    if not items:
+        text = (
+            f"🗂️ *{user_list['name']}*\n\n"
+            "_Sin items todavía._\n\n"
+            f"Para agregar algo escribe:\n"
+            f"*agregar leche a la lista de {user_list['name']}*"
+        )
+        keyboard = [
+            [InlineKeyboardButton("🗑️ Eliminar lista", callback_data=f"dellist_{list_id}")]
+        ]
+    else:
+        lines = [f"🗂️ *{user_list['name']}*\n"]
+        keyboard = []
+
+        for item in items:
+            status = "✅" if item["completed"] else "⬜"
+            lines.append(f"{status} {item['item']}")
+            keyboard.append(
+                [
+                    InlineKeyboardButton(f"{status} {item['item'][:20]}", callback_data=f"toggleitem_{item['id']}_{list_id}"),
+                    InlineKeyboardButton("🗑️", callback_data=f"delitem_{item['id']}_{list_id}"),
+                ]
+            )
+
+        keyboard.append([InlineKeyboardButton("🗑️ Eliminar lista", callback_data=f"dellist_{list_id}")])
+        text = "\n".join(lines)
+
+    await query.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HANDLERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    first_name = user.first_name if user and user.first_name else ""
+
+    await update.message.reply_text(
+        f"👋 ¡Hola {first_name}! Soy PingMyMind.\n\n"
+        "Puedo ayudarte con:\n\n"
+        "🔔 *Recordatorios*\n"
+        "• Recuérdame en 10 minutos tomar agua\n"
+        "• Recuérdame mañana a las 9 llamar al doctor\n\n"
+        "📋 *Listas*\n"
+        "• crear una lista nueva\n"
+        "• agregar leche a la lista de supermercado\n"
+        "• muéstrame mis listas\n\n"
+        "También puedes mandarme notas de voz.",
+        parse_mode="Markdown",
+    )
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    chat_id = update.effective_chat.id
+
+    if context.user_data.get("waiting_for_list_name"):
+        await handle_new_list_name(update, context)
+        return
+
+    if is_create_list_request(text):
+        await ask_list_name(update, context)
+        return
+
+    if await handle_add_item(update, text):
+        return
+
+    if is_lists_request(text):
+        await show_lists(update, chat_id)
+        return
+
+    if is_reminder_list_request(text):
+        await show_reminders(update, chat_id)
+        return
+
+    await create_reminder_from_text(update, context, text)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    await update.message.reply_text("🎤 Transcribiendo tu audio...")
+
+    voice = update.message.voice
+    file = await context.bot.get_file(voice.file_id)
+    file_path = f"/tmp/voice_{chat_id}.ogg"
+
+    await file.download_to_drive(file_path)
+
+    try:
+        text = await transcribe_audio(file_path)
+
+        await update.message.reply_text(
+            f"📝 Entendí: _{text}_",
+            parse_mode="Markdown",
+        )
+
+        if context.user_data.get("waiting_for_list_name"):
+            update.message.text = text
+            await handle_new_list_name(update, context)
+            return
+
+        if is_create_list_request(text):
+            await ask_list_name(update, context)
+            return
+
+        if await handle_add_item(update, text):
+            return
+
+        if is_lists_request(text):
+            await show_lists(update, chat_id)
+            return
+
+        if is_reminder_list_request(text):
+            await show_reminders(update, chat_id)
+            return
+
+        await create_reminder_from_text(update, context, text)
+
+    except Exception as e:
+        logger.error(f"Error audio: {e}")
+        await update.message.reply_text("❌ No pude procesar el audio. Intenta de nuevo.")
+
+
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    if data.startswith("done_"):
+        reminder_id = int(data.split("_")[1])
+        mark_done(reminder_id)
+        remove_reminder_jobs(reminder_id)
+        await query.edit_message_text("✅ ¡Recordatorio completado!")
+        return
+
+    if data.startswith("delrem_"):
+        reminder_id = int(data.split("_")[1])
+        mark_done(reminder_id)
+        remove_reminder_jobs(reminder_id)
+        await query.edit_message_text("🗑️ Recordatorio eliminado.")
+        return
+
+    if data.startswith("viewlist_"):
+        list_id = int(data.split("_")[1])
+        await show_single_list(query, list_id)
+        return
+
+    if data.startswith("dellist_"):
+        list_id = int(data.split("_")[1])
+        delete_list(list_id)
+        await query.edit_message_text("🗑️ Lista eliminada.")
+        return
+
+    if data.startswith("toggleitem_"):
+        parts = data.split("_")
+        item_id = int(parts[1])
+        list_id = int(parts[2])
+        toggle_item(item_id)
+        await show_single_list(query, list_id)
+        return
+
+    if data.startswith("delitem_"):
+        parts = data.split("_")
+        item_id = int(parts[1])
+        list_id = int(parts[2])
+        delete_item(item_id)
+        await show_single_list(query, list_id)
+        return
+
+
 def main():
     init_db()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("lista", lambda update, context: show_reminders(update, update.effective_chat.id)))
+    app.add_handler(CommandHandler("listas", lambda update, context: show_lists(update, update.effective_chat.id)))
+    app.add_handler(CommandHandler("lista", lambda update, context: show_lists(update, update.effective_chat.id)))
+    app.add_handler(CommandHandler("recordatorios", lambda update, context: show_reminders(update, update.effective_chat.id)))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_handler(CallbackQueryHandler(handle_buttons, pattern=r"^(done|del)_\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_buttons))
 
     scheduler.start()
     restore_pending_reminders(app)
