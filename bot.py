@@ -106,6 +106,18 @@ def init_db():
         """
     )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
     # Migraciones simples para bases de datos existentes.
     existing_columns = [row[1] for row in conn.execute("PRAGMA table_info(reminders)").fetchall()]
 
@@ -317,6 +329,94 @@ def delete_item(item_id: int):
     conn.close()
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MEMORIES DB
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_memory(chat_id: int, key: str, content: str) -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO memories (chat_id, key, content) VALUES (?, ?, ?)",
+        (chat_id, key.strip().lower(), content.strip()),
+    )
+    conn.commit()
+    memory_id = cur.lastrowid
+    conn.close()
+    return memory_id
+
+
+def get_memories(chat_id: int):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM memories WHERE chat_id = ? ORDER BY created_at DESC",
+        (chat_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def search_memories(chat_id: int, query: str):
+    memories = get_memories(chat_id)
+    query_words = set(normalize(query).split())
+    results = []
+
+    for memory in memories:
+        memory_text = normalize(memory["key"] + " " + memory["content"])
+        score = 0
+
+        for word in query_words:
+            if len(word) >= 3 and word in memory_text:
+                score += 1
+
+        if score > 0:
+            results.append((score, memory))
+
+    results.sort(key=lambda x: x[0], reverse=True)
+    return [memory for _, memory in results]
+
+
+def delete_memory_by_query(chat_id: int, query: str):
+    matches = search_memories(chat_id, query)
+
+    if not matches:
+        return None
+
+    memory = matches[0]
+    conn = get_conn()
+    conn.execute("DELETE FROM memories WHERE id = ?", (memory["id"],))
+    conn.commit()
+    conn.close()
+    return memory
+
+
+def extract_memory_key(content: str) -> str:
+    text = normalize(content)
+
+    patterns = [
+        r"dej[eé]\s+(mi|mis|el|la|los|las)?\s*([a-záéíóúñ0-9 ]+?)\s+en\s+",
+        r"puse\s+(mi|mis|el|la|los|las)?\s*([a-záéíóúñ0-9 ]+?)\s+en\s+",
+        r"guard[eé]\s+(mi|mis|el|la|los|las)?\s*([a-záéíóúñ0-9 ]+?)\s+en\s+",
+        r"(wifi|contraseña|clave|password|pin|pasaporte|dpi|licencia|carro|lentes|llaves)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            if len(match.groups()) >= 2:
+                key = match.group(2).strip()
+            else:
+                key = match.group(1).strip()
+
+            key = re.sub(r"\s+", " ", key)
+
+            if key:
+                return key[:60]
+
+    words = [word for word in text.split() if len(word) >= 4]
+    return " ".join(words[:3]) if words else "memoria"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TEXT DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -404,6 +504,74 @@ def split_items(text: str):
             items.append(item)
 
     return items
+
+
+
+def is_memory_list_request(text: str) -> bool:
+    text_lower = normalize(text)
+    return text_lower in [
+        "mis memorias",
+        "memorias",
+        "qué recuerdas",
+        "que recuerdas",
+        "ver memorias",
+        "muestra mis memorias",
+        "muéstrame mis memorias",
+        "muestrame mis memorias",
+    ]
+
+
+def parse_save_memory_request(text: str):
+    text_clean = text.strip()
+    patterns = [
+        r"^(recuerda que|recordá que|recorda que|guarda que|anota que|memoriza que)\s+(.+)$",
+        r"^(recuerda|guarda|anota|memoriza)\s+(.+)$",
+    ]
+
+    for pattern in patterns:
+        match = re.match(pattern, text_clean, re.IGNORECASE)
+        if match:
+            content = match.group(2).strip()
+            if content:
+                key = extract_memory_key(content)
+                return key, content
+
+    return None
+
+
+def parse_delete_memory_request(text: str):
+    text_clean = text.strip()
+    pattern = re.compile(r"^(elimina|borra|quita)\s+(la\s+)?memoria\s+(de\s+)?(.+)$", re.IGNORECASE)
+    match = pattern.match(text_clean)
+
+    if not match:
+        return None
+
+    return match.group(4).strip()
+
+
+def is_memory_question(text: str) -> bool:
+    text_lower = normalize(text)
+    triggers = [
+        "dónde dejé",
+        "donde deje",
+        "donde dejé",
+        "dónde puse",
+        "donde puse",
+        "dónde guardé",
+        "donde guarde",
+        "donde guardé",
+        "qué recuerdas de",
+        "que recuerdas de",
+        "cuál era",
+        "cual era",
+        "cuál es",
+        "cual es",
+        "me recuerdas",
+        "recuerdas dónde",
+        "recuerdas donde",
+    ]
+    return any(trigger in text_lower for trigger in triggers)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -896,6 +1064,96 @@ async def show_single_list(query, list_id: int):
     )
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MEMORIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def handle_save_memory(update: Update, text: str):
+    chat_id = update.effective_chat.id
+    parsed = parse_save_memory_request(text)
+
+    if not parsed:
+        return False
+
+    key, content = parsed
+    save_memory(chat_id, key, content)
+
+    await update.message.reply_text(
+        f"🧠 *Lo recordaré.*\n\n"
+        f"🔑 *Clave:* {key}\n"
+        f"📝 *Información:* {content}",
+        parse_mode="Markdown",
+    )
+    return True
+
+
+async def show_memories(update: Update, chat_id: int):
+    memories = get_memories(chat_id)
+
+    if not memories:
+        await update.message.reply_text(
+            "📭 No tengo memorias guardadas todavía.\n\n"
+            "Puedes decirme:\n"
+            "*recuerda que dejé mis lentes en la gaveta azul*",
+            parse_mode="Markdown",
+        )
+        return
+
+    msg = "🧠 *Mis memorias:*\n\n"
+
+    for memory in memories[:20]:
+        msg += f"• *{memory['key']}*: {memory['content']}\n"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def handle_memory_search(update: Update, text: str):
+    chat_id = update.effective_chat.id
+
+    if not is_memory_question(text):
+        return False
+
+    results = search_memories(chat_id, text)
+
+    if not results:
+        await update.message.reply_text(
+            "🤔 No encontré una memoria relacionada con eso.\n\n"
+            "Puedes guardar algo diciendo:\n"
+            "*recuerda que dejé mis lentes en la gaveta azul*",
+            parse_mode="Markdown",
+        )
+        return True
+
+    msg = "🧠 *Encontré esto:*\n\n"
+
+    for memory in results[:5]:
+        msg += f"• *{memory['key']}*: {memory['content']}\n"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    return True
+
+
+async def handle_delete_memory(update: Update, text: str):
+    chat_id = update.effective_chat.id
+    query = parse_delete_memory_request(text)
+
+    if not query:
+        return False
+
+    deleted = delete_memory_by_query(chat_id, query)
+
+    if not deleted:
+        await update.message.reply_text("❌ No encontré una memoria relacionada con eso.")
+        return True
+
+    await update.message.reply_text(
+        f"🗑️ Memoria eliminada:\n\n*{deleted['key']}*: {deleted['content']}",
+        parse_mode="Markdown",
+    )
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -914,6 +1172,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• crear una lista nueva\n"
         "• agregar leche a la lista de supermercado\n"
         "• muéstrame mis listas\n\n"
+        "🧠 *Memoria personal*\n"
+        "• recuerda que dejé mis lentes en la gaveta azul\n"
+        "• ¿dónde dejé mis lentes?\n"
+        "• mis memorias\n\n"
         "También puedes mandarme notas de voz.",
         parse_mode="Markdown",
     )
@@ -928,6 +1190,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if await handle_items_for_current_list(update, context, text):
+        return
+
+    if await handle_save_memory(update, text):
+        return
+
+    if await handle_delete_memory(update, text):
+        return
+
+    if is_memory_list_request(text):
+        await show_memories(update, chat_id)
+        return
+
+    if await handle_memory_search(update, text):
         return
 
     if is_create_list_request(text):
@@ -972,6 +1247,19 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if await handle_items_for_current_list(update, context, text):
+            return
+
+        if await handle_save_memory(update, text):
+            return
+
+        if await handle_delete_memory(update, text):
+            return
+
+        if is_memory_list_request(text):
+            await show_memories(update, chat_id)
+            return
+
+        if await handle_memory_search(update, text):
             return
 
         if is_create_list_request(text):
@@ -1082,6 +1370,7 @@ def main():
     app.add_handler(CommandHandler("listas", lambda update, context: show_lists(update, update.effective_chat.id)))
     app.add_handler(CommandHandler("lista", lambda update, context: show_lists(update, update.effective_chat.id)))
     app.add_handler(CommandHandler("recordatorios", lambda update, context: show_reminders(update, update.effective_chat.id)))
+    app.add_handler(CommandHandler("memorias", lambda update, context: show_memories(update, update.effective_chat.id)))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
