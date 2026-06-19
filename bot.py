@@ -106,6 +106,15 @@ def init_db():
         """
     )
 
+    # Migraciones simples para bases de datos existentes.
+    existing_columns = [row[1] for row in conn.execute("PRAGMA table_info(reminders)").fetchall()]
+
+    if "repeat" not in existing_columns:
+        conn.execute("ALTER TABLE reminders ADD COLUMN repeat TEXT DEFAULT 'none'")
+
+    if "active" not in existing_columns:
+        conn.execute("ALTER TABLE reminders ADD COLUMN active INTEGER DEFAULT 1")
+
     conn.commit()
     conn.close()
 
@@ -114,11 +123,11 @@ def init_db():
 # REMINDERS DB
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_reminder(chat_id: int, task: str, time: str) -> int:
+def save_reminder(chat_id: int, task: str, time: str, repeat: str = "none") -> int:
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO reminders (chat_id, task, time) VALUES (?, ?, ?)",
-        (chat_id, task, time),
+        "INSERT INTO reminders (chat_id, task, time, repeat, active) VALUES (?, ?, ?, ?, 1)",
+        (chat_id, task, time, repeat),
     )
     conn.commit()
     reminder_id = cur.lastrowid
@@ -146,12 +155,32 @@ def mark_done(reminder_id: int):
     conn.close()
 
 
+def deactivate_reminder(reminder_id: int):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE reminders SET active = 0, done = 1 WHERE id = ?",
+        (reminder_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_reminder_time(reminder_id: int, new_time: str):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE reminders SET time = ? WHERE id = ?",
+        (new_time, reminder_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_pending_reminders(chat_id: int):
     conn = get_conn()
     rows = conn.execute(
         """
         SELECT * FROM reminders
-        WHERE chat_id = ? AND done = 0
+        WHERE chat_id = ? AND done = 0 AND active = 1
         ORDER BY time ASC
         """,
         (chat_id,),
@@ -394,11 +423,17 @@ Zona horaria: Guatemala, America/Guatemala, UTC-6.
 Extrae del mensaje:
 - "task": la acción breve que se debe recordar
 - "time": fecha y hora exacta en formato ISO 8601: YYYY-MM-DDTHH:MM:00
+- "repeat": "none" o "daily"
 
 Reglas:
 - Si dice "en 1 minuto", suma 1 minuto a la hora actual.
 - Si dice "en 2 minutos", suma 2 minutos.
 - Si dice "mañana", usa la fecha de mañana.
+- Si dice "todos los días", "cada día", "diario", "diariamente" o "todos los dias", usa repeat: "daily".
+- Si dice "todos los días a las 8pm", usa la próxima fecha a las 20:00.
+- Si dice "a las 8 de la noche", interpreta 20:00.
+- Si dice "a las 8 pm", interpreta 20:00.
+- Si dice "a las 8 am", interpreta 08:00.
 - Si dice "a las 3", interpreta según contexto como 3 PM si parece horario diurno.
 - Si no hay hora clara, devuelve "time": null.
 - Si el mensaje parece de listas, compras o items sin hora, devuelve "time": null.
@@ -409,7 +444,7 @@ Reglas:
 Mensaje: "{text}"
 
 Formato:
-{{"task":"...", "time":"YYYY-MM-DDTHH:MM:00"}}
+{{"task":"...", "time":"YYYY-MM-DDTHH:MM:00", "repeat":"none"}}
 """
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -441,6 +476,8 @@ Formato:
         return None
 
     if result.get("task") and result.get("time"):
+        if result.get("repeat") not in ["none", "daily"]:
+            result["repeat"] = "none"
         return result
 
     return None
@@ -474,11 +511,29 @@ async def transcribe_audio(file_path: str) -> str:
 # REMINDERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def get_next_daily_time(dt: datetime) -> datetime:
+    return dt + timedelta(days=1)
+
+
+def schedule_reminder_job(app, chat_id: int, reminder_id: int, task: str, run_date: datetime):
+    scheduler.add_job(
+        send_reminder_job,
+        "date",
+        run_date=run_date,
+        args=[app, chat_id, reminder_id, task],
+        id=f"remind_{reminder_id}",
+        replace_existing=True,
+        misfire_grace_time=120,
+    )
+
+
 async def send_reminder_job(app, chat_id: int, reminder_id: int, task: str):
     reminder = get_reminder(reminder_id)
 
-    if not reminder or reminder["done"]:
+    if not reminder or reminder.get("done") or not reminder.get("active", 1):
         return
+
+    repeat = reminder.get("repeat", "none")
 
     keyboard = [
         [
@@ -487,13 +542,16 @@ async def send_reminder_job(app, chat_id: int, reminder_id: int, task: str):
         ]
     ]
 
+    repeat_text = "\n🔁 Se repetirá todos los días." if repeat == "daily" else ""
+
     await app.bot.send_message(
         chat_id=chat_id,
-        text=f"🔔 *Recordatorio:* {task}\n\n¡Presiona Completado cuando termines!",
+        text=f"🔔 *Recordatorio:* {task}{repeat_text}\n\n¡Presiona Completado cuando termines!",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
+    # Si no lo marcas completado, te seguirá insistiendo cada 5 minutos.
     next_time = datetime.now(pytz.timezone(TIMEZONE)) + timedelta(minutes=5)
 
     scheduler.add_job(
@@ -523,7 +581,8 @@ async def create_reminder_from_text(update: Update, context: ContextTypes.DEFAUL
             "❌ No pude entender una hora para recordatorio.\n\n"
             "Ejemplos:\n"
             "• *Recuérdame en 10 minutos tomar agua*\n"
-            "• *Recuérdame mañana a las 9 llamar al doctor*\n\n"
+            "• *Recuérdame mañana a las 9 llamar al doctor*\n"
+            "• *Recuérdame todos los días a las 8pm dar la pastilla*\n\n"
             "Para listas puedes decir:\n"
             "• *crear una lista nueva*\n"
             "• *agregar leche a la lista de supermercado*\n"
@@ -540,27 +599,33 @@ async def create_reminder_from_text(update: Update, context: ContextTypes.DEFAUL
 
     now = datetime.now(tz)
 
+    repeat = data.get("repeat", "none")
+
     if run_date <= now:
-        await update.message.reply_text("❌ Esa hora ya pasó. Intenta con una hora futura.")
-        return
+        if repeat == "daily":
+            run_date = get_next_daily_time(run_date)
+        else:
+            await update.message.reply_text("❌ Esa hora ya pasó. Intenta con una hora futura.")
+            return
 
-    reminder_id = save_reminder(chat_id, data["task"], run_date.isoformat())
+    reminder_id = save_reminder(chat_id, data["task"], run_date.isoformat(), repeat)
 
-    scheduler.add_job(
-        send_reminder_job,
-        "date",
-        run_date=run_date,
-        args=[context.application, chat_id, reminder_id, data["task"]],
-        id=f"remind_{reminder_id}",
-        misfire_grace_time=120,
+    schedule_reminder_job(
+        context.application,
+        chat_id,
+        reminder_id,
+        data["task"],
+        run_date,
     )
 
     formatted = run_date.strftime("%d/%m/%Y a las %I:%M %p")
+    repeat_text = "\n🔁 Se repetirá todos los días." if repeat == "daily" else ""
 
     await update.message.reply_text(
         f"✅ *Recordatorio guardado:*\n\n"
         f"📌 {data['task']}\n"
-        f"🕐 {formatted}",
+        f"🕐 {formatted}"
+        f"{repeat_text}",
         parse_mode="Markdown",
     )
 
@@ -591,8 +656,10 @@ async def show_reminders(update: Update, chat_id: int):
             ]
         ]
 
+        repeat_text = "\n🔁 Todos los días" if reminder.get("repeat") == "daily" else ""
+
         await update.message.reply_text(
-            f"📌 *{reminder['task']}*\n🕐 {formatted}",
+            f"📌 *{reminder['task']}*\n🕐 {formatted}{repeat_text}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
@@ -603,7 +670,7 @@ def restore_pending_reminders(app: Application):
     rows = conn.execute(
         """
         SELECT * FROM reminders
-        WHERE done = 0
+        WHERE done = 0 AND active = 1
         """
     ).fetchall()
     conn.close()
@@ -619,16 +686,19 @@ def restore_pending_reminders(app: Application):
             run_date = tz.localize(run_date)
 
         if run_date <= now:
-            run_date = now + timedelta(seconds=10)
+            if reminder.get("repeat") == "daily":
+                while run_date <= now:
+                    run_date = get_next_daily_time(run_date)
+                update_reminder_time(reminder["id"], run_date.isoformat())
+            else:
+                run_date = now + timedelta(seconds=10)
 
-        scheduler.add_job(
-            send_reminder_job,
-            "date",
-            run_date=run_date,
-            args=[app, reminder["chat_id"], reminder["id"], reminder["task"]],
-            id=f"remind_{reminder['id']}",
-            replace_existing=True,
-            misfire_grace_time=120,
+        schedule_reminder_job(
+            app,
+            reminder["chat_id"],
+            reminder["id"],
+            reminder["task"],
+            run_date,
         )
 
     logger.info(f"🔁 Recordatorios restaurados: {len(rows)}")
@@ -934,14 +1004,43 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("done_"):
         reminder_id = int(data.split("_")[1])
-        mark_done(reminder_id)
+        reminder = get_reminder(reminder_id)
         remove_reminder_jobs(reminder_id)
-        await query.edit_message_text("✅ ¡Recordatorio completado!")
+
+        if reminder and reminder.get("repeat") == "daily" and reminder.get("active", 1):
+            tz = pytz.timezone(TIMEZONE)
+            current_time = datetime.fromisoformat(reminder["time"])
+            if current_time.tzinfo is None:
+                current_time = tz.localize(current_time)
+
+            next_daily = get_next_daily_time(current_time)
+            now = datetime.now(tz)
+
+            while next_daily <= now:
+                next_daily = get_next_daily_time(next_daily)
+
+            update_reminder_time(reminder_id, next_daily.isoformat())
+            schedule_reminder_job(
+                context.application,
+                reminder["chat_id"],
+                reminder_id,
+                reminder["task"],
+                next_daily,
+            )
+
+            await query.edit_message_text(
+                f"✅ ¡Recordatorio completado por hoy!\n\n"
+                f"🔁 Te volveré a recordar mañana."
+            )
+        else:
+            mark_done(reminder_id)
+            await query.edit_message_text("✅ ¡Recordatorio completado!")
+
         return
 
     if data.startswith("delrem_"):
         reminder_id = int(data.split("_")[1])
-        mark_done(reminder_id)
+        deactivate_reminder(reminder_id)
         remove_reminder_jobs(reminder_id)
         await query.edit_message_text("🗑️ Recordatorio eliminado.")
         return
