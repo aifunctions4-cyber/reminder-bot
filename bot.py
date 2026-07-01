@@ -3,6 +3,7 @@ import logging
 import json
 import sqlite3
 import re
+import calendar
 from datetime import datetime, timedelta
 
 import httpx
@@ -590,24 +591,40 @@ Zona horaria: Guatemala, America/Guatemala, UTC-6.
 
 Extrae del mensaje:
 - "task": la acción breve que se debe recordar
-- "time": fecha y hora exacta en formato ISO 8601: YYYY-MM-DDTHH:MM:00
-- "repeat": "none" o "daily"
+- "time": fecha y hora exacta de la PRÓXIMA ocurrencia en formato ISO 8601: YYYY-MM-DDTHH:MM:00
+- "repeat": "none", "daily", "weekly", "monthly" o "yearly"
 
-Reglas:
-- Si dice "en 1 minuto", suma 1 minuto a la hora actual.
-- Si dice "en 2 minutos", suma 2 minutos.
+Reglas importantes:
+- Si dice "en 1 minuto", suma 1 minuto a la hora actual y usa repeat: "none".
+- Si dice "en 2 minutos", suma 2 minutos y usa repeat: "none".
 - Si dice "mañana", usa la fecha de mañana.
 - Si dice "todos los días", "cada día", "diario", "diariamente" o "todos los dias", usa repeat: "daily".
 - Si dice "todos los días a las 8pm", usa la próxima fecha a las 20:00.
+- Si dice "cada lunes", "todos los viernes", etc., usa repeat: "weekly" y calcula la próxima fecha de ese día.
+- Si dice "el 21 de cada mes", "cada 21", "todos los 21", usa repeat: "monthly".
+- Si dice "el 21 de cada mes" sin hora, usa las 09:00 AM por defecto.
+- Si dice "cada 1 de mes" o "cada primero de mes", usa repeat: "monthly".
+- Si dice "cada año", "todos los años", "cada 15 de septiembre", usa repeat: "yearly".
+- Si dice una fecha anual sin hora, usa las 09:00 AM por defecto.
 - Si dice "a las 8 de la noche", interpreta 20:00.
 - Si dice "a las 8 pm", interpreta 20:00.
 - Si dice "a las 8 am", interpreta 08:00.
 - Si dice "a las 3", interpreta según contexto como 3 PM si parece horario diurno.
-- Si no hay hora clara, devuelve "time": null.
-- Si el mensaje parece de listas, compras o items sin hora, devuelve "time": null.
+- Si no hay fecha/hora suficiente para calcular una próxima ocurrencia, devuelve "time": null.
+- Si el mensaje parece de listas, compras o items sin fecha/hora, devuelve "time": null.
 - Responde SOLO JSON válido.
 - No uses backticks.
 - No agregues explicación.
+
+Ejemplos:
+Mensaje: "El 21 de cada mes tengo que transferir dinero a Comis"
+Respuesta: {{"task":"transferir dinero a Comis", "time":"YYYY-MM-21T09:00:00", "repeat":"monthly"}}
+
+Mensaje: "todos los viernes a las 5pm revisar pagos"
+Respuesta: {{"task":"revisar pagos", "time":"YYYY-MM-DDT17:00:00", "repeat":"weekly"}}
+
+Mensaje: "cada 15 de septiembre felicitar a mi mamá"
+Respuesta: {{"task":"felicitar a mi mamá", "time":"YYYY-09-15T09:00:00", "repeat":"yearly"}}
 
 Mensaje: "{text}"
 
@@ -644,7 +661,7 @@ Formato:
         return None
 
     if result.get("task") and result.get("time"):
-        if result.get("repeat") not in ["none", "daily"]:
+        if result.get("repeat") not in ["none", "daily", "weekly", "monthly", "yearly"]:
             result["repeat"] = "none"
         return result
 
@@ -679,8 +696,76 @@ async def transcribe_audio(file_path: str) -> str:
 # REMINDERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_next_daily_time(dt: datetime) -> datetime:
-    return dt + timedelta(days=1)
+def add_month_safe(dt: datetime) -> datetime:
+    year = dt.year
+    month = dt.month + 1
+
+    if month > 12:
+        month = 1
+        year += 1
+
+    last_day = calendar.monthrange(year, month)[1]
+    day = min(dt.day, last_day)
+
+    return dt.replace(year=year, month=month, day=day)
+
+
+def add_year_safe(dt: datetime) -> datetime:
+    year = dt.year + 1
+
+    try:
+        return dt.replace(year=year)
+    except ValueError:
+        # Para 29 de febrero, usar 28 de febrero en años no bisiestos.
+        return dt.replace(year=year, day=28)
+
+
+def get_next_repeat_time(dt: datetime, repeat: str) -> datetime:
+    if repeat == "daily":
+        return dt + timedelta(days=1)
+
+    if repeat == "weekly":
+        return dt + timedelta(weeks=1)
+
+    if repeat == "monthly":
+        return add_month_safe(dt)
+
+    if repeat == "yearly":
+        return add_year_safe(dt)
+
+    return dt
+
+
+def get_repeat_text(repeat: str) -> str:
+    if repeat == "daily":
+        return "🔁 Se repetirá todos los días."
+
+    if repeat == "weekly":
+        return "🔁 Se repetirá cada semana."
+
+    if repeat == "monthly":
+        return "🔁 Se repetirá cada mes."
+
+    if repeat == "yearly":
+        return "🔁 Se repetirá cada año."
+
+    return ""
+
+
+def get_repeat_short(repeat: str) -> str:
+    if repeat == "daily":
+        return "🔁 Todos los días"
+
+    if repeat == "weekly":
+        return "🔁 Cada semana"
+
+    if repeat == "monthly":
+        return "🔁 Cada mes"
+
+    if repeat == "yearly":
+        return "🔁 Cada año"
+
+    return ""
 
 
 def schedule_reminder_job(app, chat_id: int, reminder_id: int, task: str, run_date: datetime):
@@ -693,7 +778,6 @@ def schedule_reminder_job(app, chat_id: int, reminder_id: int, task: str, run_da
         replace_existing=True,
         misfire_grace_time=120,
     )
-
 
 async def send_reminder_job(app, chat_id: int, reminder_id: int, task: str):
     reminder = get_reminder(reminder_id)
@@ -710,7 +794,8 @@ async def send_reminder_job(app, chat_id: int, reminder_id: int, task: str):
         ]
     ]
 
-    repeat_text = "\n🔁 Se repetirá todos los días." if repeat == "daily" else ""
+    repeat_text_value = get_repeat_text(repeat)
+    repeat_text = f"\n{repeat_text_value}" if repeat_text_value else ""
 
     await app.bot.send_message(
         chat_id=chat_id,
@@ -750,7 +835,9 @@ async def create_reminder_from_text(update: Update, context: ContextTypes.DEFAUL
             "Ejemplos:\n"
             "• *Recuérdame en 10 minutos tomar agua*\n"
             "• *Recuérdame mañana a las 9 llamar al doctor*\n"
-            "• *Recuérdame todos los días a las 8pm dar la pastilla*\n\n"
+            "• *Recuérdame todos los días a las 8pm dar la pastilla*\n"
+            "• *El 21 de cada mes transferir dinero a Comis*\n"
+            "• *Todos los viernes a las 5pm revisar pagos*\n\n"
             "Para listas puedes decir:\n"
             "• *crear una lista nueva*\n"
             "• *agregar leche a la lista de supermercado*\n"
@@ -770,8 +857,9 @@ async def create_reminder_from_text(update: Update, context: ContextTypes.DEFAUL
     repeat = data.get("repeat", "none")
 
     if run_date <= now:
-        if repeat == "daily":
-            run_date = get_next_daily_time(run_date)
+        if repeat in ["daily", "weekly", "monthly", "yearly"]:
+            while run_date <= now:
+                run_date = get_next_repeat_time(run_date, repeat)
         else:
             await update.message.reply_text("❌ Esa hora ya pasó. Intenta con una hora futura.")
             return
@@ -787,7 +875,8 @@ async def create_reminder_from_text(update: Update, context: ContextTypes.DEFAUL
     )
 
     formatted = run_date.strftime("%d/%m/%Y a las %I:%M %p")
-    repeat_text = "\n🔁 Se repetirá todos los días." if repeat == "daily" else ""
+    repeat_text_value = get_repeat_text(repeat)
+    repeat_text = f"\n{repeat_text_value}" if repeat_text_value else ""
 
     await update.message.reply_text(
         f"✅ *Recordatorio guardado:*\n\n"
@@ -824,7 +913,8 @@ async def show_reminders(update: Update, chat_id: int):
             ]
         ]
 
-        repeat_text = "\n🔁 Todos los días" if reminder.get("repeat") == "daily" else ""
+        repeat_short = get_repeat_short(reminder.get("repeat", "none"))
+        repeat_text = f"\n{repeat_short}" if repeat_short else ""
 
         await update.message.reply_text(
             f"📌 *{reminder['task']}*\n🕐 {formatted}{repeat_text}",
@@ -854,9 +944,11 @@ def restore_pending_reminders(app: Application):
             run_date = tz.localize(run_date)
 
         if run_date <= now:
-            if reminder.get("repeat") == "daily":
+            repeat = reminder.get("repeat", "none")
+
+            if repeat in ["daily", "weekly", "monthly", "yearly"]:
                 while run_date <= now:
-                    run_date = get_next_daily_time(run_date)
+                    run_date = get_next_repeat_time(run_date, repeat)
                 update_reminder_time(reminder["id"], run_date.isoformat())
             else:
                 run_date = now + timedelta(seconds=10)
@@ -1295,30 +1387,35 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reminder = get_reminder(reminder_id)
         remove_reminder_jobs(reminder_id)
 
-        if reminder and reminder.get("repeat") == "daily" and reminder.get("active", 1):
+        if reminder and reminder.get("repeat") in ["daily", "weekly", "monthly", "yearly"] and reminder.get("active", 1):
             tz = pytz.timezone(TIMEZONE)
+            repeat = reminder.get("repeat", "none")
+
             current_time = datetime.fromisoformat(reminder["time"])
             if current_time.tzinfo is None:
                 current_time = tz.localize(current_time)
 
-            next_daily = get_next_daily_time(current_time)
+            next_time = get_next_repeat_time(current_time, repeat)
             now = datetime.now(tz)
 
-            while next_daily <= now:
-                next_daily = get_next_daily_time(next_daily)
+            while next_time <= now:
+                next_time = get_next_repeat_time(next_time, repeat)
 
-            update_reminder_time(reminder_id, next_daily.isoformat())
+            update_reminder_time(reminder_id, next_time.isoformat())
             schedule_reminder_job(
                 context.application,
                 reminder["chat_id"],
                 reminder_id,
                 reminder["task"],
-                next_daily,
+                next_time,
             )
 
+            repeat_label = get_repeat_short(repeat).replace("🔁 ", "")
+
             await query.edit_message_text(
-                f"✅ ¡Recordatorio completado por hoy!\n\n"
-                f"🔁 Te volveré a recordar mañana."
+                f"✅ ¡Recordatorio completado!\n\n"
+                f"🔁 Próximo recordatorio: {next_time.strftime('%d/%m/%Y a las %I:%M %p')}\n"
+                f"({repeat_label})"
             )
         else:
             mark_done(reminder_id)
